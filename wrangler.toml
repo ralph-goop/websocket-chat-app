@@ -2,7 +2,7 @@ name = "edge-chat-demo"
 account_id = "976c1ea65ea1e8130133ab8cfcfafa76"
 compatibility_date = "2024-01-01"
 
-main = "src/chat.mjs"
+main = "src/index.mjs"
 
 [durable_objects]
 bindings = [
