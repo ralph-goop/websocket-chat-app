@@ -1,7 +1,19 @@
-// Edge Chat Demo with Room Registry and Stats
-// This is an enhanced version of the Cloudflare Workers chat demo with room listings and statistics
+// Edge Chat Demo with Room Registry and Stats - HIGH PERFORMANCE VERSION
+// Optimized for scale: handles thousands of rooms and users efficiently
 
 import HTML from "./chat.html";
+
+// Constants for performance tuning
+const CONFIG = {
+  MAX_ROOMS_LISTED: 50,           // Pagination: only show top 50 rooms
+  MAX_CONNECTIONS_PER_ROOM: 100,  // Prevent resource exhaustion
+  MAX_MESSAGES_STORED: 1000,      // Retention: keep last 1000 messages per room
+  RATE_LIMIT_WINDOW: 2,           // Seconds between messages
+  RATE_LIMIT_GRACE: 15,           // Grace period in seconds
+  ROOM_CACHE_TTL: 5000,           // Registry cache TTL in ms
+  STATS_BATCH_INTERVAL: 30000,    // Batch stats updates every 30s
+  MESSAGE_BATCH_SIZE: 100,        // Load last 100 messages initially
+};
 
 // Error handling utility
 async function handleErrors(request, func) {
@@ -18,6 +30,17 @@ async function handleErrors(request, func) {
       return new Response(err.stack, {status: 500});
     }
   }
+}
+
+// Simple hash function for IP-based rate limiting
+function hashIP(ip) {
+  let hash = 0;
+  for (let i = 0; i < ip.length; i++) {
+    const char = ip.charCodeAt(i);
+    hash = ((hash << 5) - hash) + char;
+    hash = hash & hash;
+  }
+  return Math.abs(hash).toString(16);
 }
 
 // Main Worker export
@@ -82,9 +105,9 @@ async function handleApiRequest(path, request, env) {
       let newUrl = new URL(request.url);
       newUrl.pathname = "/" + path.slice(2).join("/");
 
-      // Track room access in registry
+      // Track room access in registry (fire and forget)
       if (path[2] === "websocket") {
-        await trackRoomAccess(env, name, id);
+        trackRoomAccess(env, name, id).catch(() => {});
       }
 
       return roomObject.fetch(newUrl, request);
@@ -95,7 +118,7 @@ async function handleApiRequest(path, request, env) {
   }
 }
 
-// Track room access in registry
+// Track room access in registry (best effort, don't await)
 async function trackRoomAccess(env, roomName, roomId) {
   try {
     let registryId = env.roomRegistry.idFromName("global");
@@ -110,7 +133,7 @@ async function trackRoomAccess(env, roomName, roomId) {
       })
     });
   } catch (err) {
-    console.error("Failed to track room access:", err);
+    // Silently fail - tracking is best-effort
   }
 }
 
@@ -124,6 +147,7 @@ export class RoomRegistry {
     // In-memory cache for fast reads
     this.roomsCache = null;
     this.cacheExpiry = 0;
+    this.lastCleanup = 0;
   }
 
   async fetch(request) {
@@ -132,25 +156,30 @@ export class RoomRegistry {
 
       switch (url.pathname) {
         case "/list": {
-          // Get all rooms with stats - use cache for performance
+          // Get rooms with pagination - use cache for performance
           const now = Date.now();
           if (!this.roomsCache || now > this.cacheExpiry) {
-            const rooms = await this.getAllRoomsWithStats();
+            const rooms = await this.getTopRooms(CONFIG.MAX_ROOMS_LISTED);
             this.roomsCache = rooms;
-            this.cacheExpiry = now + 5000; // Cache for 5 seconds
+            this.cacheExpiry = now + CONFIG.ROOM_CACHE_TTL;
+            
+            // Periodic cleanup of old room entries
+            if (now - this.lastCleanup > 3600000) { // 1 hour
+              this.lastCleanup = now;
+              this.cleanupOldRooms().catch(() => {});
+            }
           }
           
           return new Response(JSON.stringify(this.roomsCache), {
             headers: {
               "Content-Type": "application/json",
               "Access-Control-Allow-Origin": "*",
-              "Cache-Control": "no-cache"
+              "Cache-Control": "public, max-age=5"
             }
           });
         }
 
         case "/track": {
-          // Track that a room is being accessed
           if (request.method !== "POST") {
             return new Response("Method not allowed", {status: 405});
           }
@@ -161,7 +190,6 @@ export class RoomRegistry {
         }
 
         case "/update-stats": {
-          // Update room statistics from ChatRoom
           if (request.method !== "POST") {
             return new Response("Method not allowed", {status: 405});
           }
@@ -181,18 +209,19 @@ export class RoomRegistry {
     let roomKey = `room:${roomId}`;
     let existing = await this.storage.get(roomKey);
     
+    const now = Date.now();
     if (!existing) {
       await this.storage.put(roomKey, {
         name: roomName,
         id: roomId,
-        createdAt: Date.now(),
-        lastActivity: Date.now(),
+        createdAt: now,
+        lastActivity: now,
         totalMessages: 0,
-        uniquePosters: new Set(),
+        uniquePosters: [], // Store as array for JSON serialization
         activeConnections: 0
       });
     } else {
-      existing.lastActivity = Date.now();
+      existing.lastActivity = now;
       await this.storage.put(roomKey, existing);
     }
     
@@ -207,7 +236,11 @@ export class RoomRegistry {
     if (room) {
       room.totalMessages = stats.totalMessages || room.totalMessages;
       room.activeConnections = stats.activeConnections || room.activeConnections;
-      room.uniquePosters = new Set([...(room.uniquePosters || []), ...(stats.uniquePosters || [])]);
+      
+      // Merge unique posters efficiently
+      const posterSet = new Set([...room.uniquePosters, ...stats.uniquePosters]);
+      room.uniquePosters = Array.from(posterSet);
+      
       room.lastActivity = Date.now();
       await this.storage.put(roomKey, room);
     }
@@ -216,33 +249,19 @@ export class RoomRegistry {
     this.roomsCache = null;
   }
 
-  async getAllRoomsWithStats() {
-    // Get all room entries
-    let rooms = [];
+  async getTopRooms(limit) {
+    // Get all room entries - this is O(n) but n should be manageable with cleanup
     let entries = await this.storage.list({prefix: "room:"});
+    let rooms = [];
     
     for (let [key, room] of entries) {
-      // Get real-time stats from the actual room
-      try {
-        let roomObject = this.env.rooms.get(this.env.rooms.idFromString(room.id));
-        let statsResponse = await roomObject.fetch("https://internal/stats");
-        if (statsResponse.ok) {
-          let liveStats = await statsResponse.json();
-          room.activeConnections = liveStats.activeConnections || 0;
-          room.totalMessages = liveStats.totalMessages || room.totalMessages;
-          room.uniquePosters = new Set([...(room.uniquePosters || []), ...(liveStats.uniquePosters || [])]);
-        }
-      } catch (err) {
-        // Room might not exist yet, use stored stats
-      }
-      
       rooms.push({
         name: room.name,
         id: room.id,
         createdAt: room.createdAt,
         lastActivity: room.lastActivity,
         totalMessages: room.totalMessages || 0,
-        uniquePosterCount: room.uniquePosters ? room.uniquePosters.size : 0,
+        uniquePosterCount: room.uniquePosters ? room.uniquePosters.length : 0,
         activeConnections: room.activeConnections || 0
       });
     }
@@ -250,18 +269,31 @@ export class RoomRegistry {
     // Sort by last activity (most recent first)
     rooms.sort((a, b) => b.lastActivity - a.lastActivity);
     
-    return rooms;
+    // Return only top N rooms for pagination
+    return rooms.slice(0, limit);
+  }
+
+  async cleanupOldRooms() {
+    // Remove rooms that haven't been active in 7 days
+    const cutoff = Date.now() - (7 * 24 * 60 * 60 * 1000);
+    let entries = await this.storage.list({prefix: "room:"});
+    
+    for (let [key, room] of entries) {
+      if (room.lastActivity < cutoff && room.activeConnections === 0) {
+        await this.storage.delete(key);
+      }
+    }
   }
 }
 
-// ChatRoom Durable Object - Enhanced with stats tracking
+// ChatRoom Durable Object - HIGH PERFORMANCE VERSION
 export class ChatRoom {
   constructor(state, env) {
     this.state = state;
     this.storage = state.storage;
     this.env = env;
     this.sessions = new Map();
-    this.connectedUsers = new Set(); // Track connected usernames to prevent duplicates
+    this.connectedUsers = new Set();
     
     // Restore sessions from hibernation
     this.state.getWebSockets().forEach((webSocket) => {
@@ -269,7 +301,7 @@ export class ChatRoom {
       if (meta.name) {
         this.connectedUsers.add(meta.name);
       }
-      let limiterId = this.env.limiters.idFromString(meta.limiterId);
+      let limiterId = this.env.limiters.idFromName(meta.limiterId || "default");
       let limiter = new RateLimiterClient(
         () => this.env.limiters.get(limiterId),
         err => webSocket.close(1011, err.stack));
@@ -279,10 +311,41 @@ export class ChatRoom {
 
     this.lastTimestamp = 0;
     
-    // Stats tracking
+    // Stats tracking - will be loaded from storage
+    this.statsLoaded = false;
     this.totalMessages = 0;
     this.uniquePosters = new Set();
-    this.messageHistory = [];
+    
+    // Batched stats reporting
+    this.statsDirty = false;
+    this.lastStatsReport = 0;
+  }
+
+  async loadStats() {
+    if (this.statsLoaded) return;
+    
+    try {
+      let stats = await this.storage.get("roomStats");
+      if (stats) {
+        this.totalMessages = stats.totalMessages || 0;
+        this.uniquePosters = new Set(stats.uniquePosters || []);
+      }
+      this.statsLoaded = true;
+    } catch (err) {
+      this.statsLoaded = true;
+    }
+  }
+
+  async saveStats() {
+    try {
+      await this.storage.put("roomStats", {
+        totalMessages: this.totalMessages,
+        uniquePosters: Array.from(this.uniquePosters),
+        lastUpdated: Date.now()
+      });
+    } catch (err) {
+      // Best effort
+    }
   }
 
   async fetch(request) {
@@ -295,14 +358,19 @@ export class ChatRoom {
             return new Response("expected websocket", {status: 400});
           }
 
-          let ip = request.headers.get("CF-Connecting-IP");
+          // Check connection limit
+          if (this.sessions.size >= CONFIG.MAX_CONNECTIONS_PER_ROOM) {
+            return new Response("Room is full (max 100 users)", {status: 503});
+          }
+
+          let ip = request.headers.get("CF-Connecting-IP") || "unknown";
           let pair = new WebSocketPair();
           await this.handleSession(pair[1], ip);
           return new Response(null, { status: 101, webSocket: pair[0] });
         }
 
         case "/stats": {
-          // Return current stats for this room
+          await this.loadStats();
           let stats = {
             activeConnections: this.sessions.size,
             totalMessages: this.totalMessages,
@@ -320,15 +388,19 @@ export class ChatRoom {
   }
 
   async handleSession(webSocket, ip) {
+    await this.loadStats();
+    
     this.state.acceptWebSocket(webSocket);
 
-    let limiterId = this.env.limiters.idFromName(ip);
+    // Use hashed IP for rate limiting to reduce DO count
+    let hashedIP = hashIP(ip);
+    let limiterId = this.env.limiters.idFromName(hashedIP);
     let limiter = new RateLimiterClient(
         () => this.env.limiters.get(limiterId),
         err => webSocket.close(1011, err.stack));
 
-    let session = { limiterId, limiter, blockedMessages: [] };
-    webSocket.serializeAttachment({ ...webSocket.deserializeAttachment(), limiterId: limiterId.toString() });
+    let session = { limiterId: hashedIP, limiter, blockedMessages: [] };
+    webSocket.serializeAttachment({ limiterId: hashedIP });
     this.sessions.set(webSocket, session);
 
     // Queue join messages for existing users
@@ -338,20 +410,22 @@ export class ChatRoom {
       }
     }
 
-    // Load last 100 messages
-    let storage = await this.storage.list({reverse: true, limit: 100});
+    // Load last N messages efficiently
+    let storage = await this.storage.list({reverse: true, limit: CONFIG.MESSAGE_BATCH_SIZE});
     let backlog = [...storage.values()];
     backlog.reverse();
     backlog.forEach(value => {
       session.blockedMessages.push(value);
     });
 
-    // Report stats update to registry asynchronously (don't block)
-    this.reportStatsToRegistry().catch(err => {});
+    // Schedule stats update (batched)
+    this.scheduleStatsUpdate();
   }
 
   async webSocketMessage(webSocket, msg) {
     try {
+      await this.loadStats();
+      
       let session = this.sessions.get(webSocket);
       if (session.quit) {
         webSocket.close(1011, "WebSocket broken.");
@@ -380,7 +454,10 @@ export class ChatRoom {
         
         session.name = requestedName;
         this.connectedUsers.add(session.name);
-        webSocket.serializeAttachment({ ...webSocket.deserializeAttachment(), name: session.name });
+        webSocket.serializeAttachment({ 
+          ...webSocket.deserializeAttachment(), 
+          name: session.name 
+        });
 
         if (session.name.length > 32) {
           webSocket.send(JSON.stringify({error: "Name too long."}));
@@ -398,8 +475,8 @@ export class ChatRoom {
         this.broadcast({joined: session.name});
         webSocket.send(JSON.stringify({ready: true}));
         
-        // Report stats update asynchronously (don't block)
-        this.reportStatsToRegistry().catch(err => {});
+        // Schedule stats update
+        this.scheduleStatsUpdate();
         return;
       }
 
@@ -414,6 +491,7 @@ export class ChatRoom {
       // Track stats
       this.totalMessages++;
       this.uniquePosters.add(session.name);
+      this.statsDirty = true;
 
       data.timestamp = Math.max(Date.now(), this.lastTimestamp + 1);
       this.lastTimestamp = data.timestamp;
@@ -423,15 +501,68 @@ export class ChatRoom {
       // Broadcast immediately for speed
       this.broadcast(dataStr);
 
-      // Save message and report stats asynchronously (don't block)
-      let key = new Date(data.timestamp).toISOString();
-      this.storage.put(key, dataStr).catch(err => console.error("Failed to save message:", err));
+      // Save message asynchronously with retention
+      this.saveMessageWithRetention(data.timestamp, dataStr);
       
-      // Report stats update asynchronously
-      this.reportStatsToRegistry().catch(err => {});
+      // Schedule stats update (batched)
+      this.scheduleStatsUpdate();
     } catch (err) {
       webSocket.send(JSON.stringify({error: err.stack}));
     }
+  }
+
+  async saveMessageWithRetention(timestamp, dataStr) {
+    try {
+      let key = new Date(timestamp).toISOString();
+      await this.storage.put(key, dataStr);
+      
+      // Enforce retention limit asynchronously
+      this.enforceRetention().catch(() => {});
+    } catch (err) {
+      console.error("Failed to save message:", err);
+    }
+  }
+
+  async enforceRetention() {
+    try {
+      // Count messages
+      let count = 0;
+      let oldestKeys = [];
+      
+      let entries = await this.storage.list();
+      for (let [key, value] of entries) {
+        if (key !== "roomStats") {
+          count++;
+          oldestKeys.push(key);
+        }
+      }
+      
+      // Sort to find oldest
+      oldestKeys.sort();
+      
+      // Delete oldest if over limit
+      while (count > CONFIG.MAX_MESSAGES_STORED && oldestKeys.length > 0) {
+        let keyToDelete = oldestKeys.shift();
+        await this.storage.delete(keyToDelete);
+        count--;
+      }
+    } catch (err) {
+      // Best effort
+    }
+  }
+
+  scheduleStatsUpdate() {
+    const now = Date.now();
+    if (!this.statsDirty || now - this.lastStatsReport < CONFIG.STATS_BATCH_INTERVAL) {
+      return;
+    }
+    
+    this.statsDirty = false;
+    this.lastStatsReport = now;
+    
+    // Save to storage and report to registry asynchronously
+    this.saveStats().catch(() => {});
+    this.reportStatsToRegistry().catch(() => {});
   }
 
   async closeOrErrorHandler(webSocket) {
@@ -439,12 +570,12 @@ export class ChatRoom {
     session.quit = true;
     this.sessions.delete(webSocket);
     if (session.name) {
-      // Remove from connected users set to allow reconnection
       this.connectedUsers.delete(session.name);
       this.broadcast({quit: session.name});
     }
-    // Report stats update asynchronously (don't block)
-    this.reportStatsToRegistry().catch(err => {});
+    
+    // Schedule stats update
+    this.scheduleStatsUpdate();
   }
 
   async webSocketClose(webSocket, code, reason, wasClean) {
@@ -484,9 +615,7 @@ export class ChatRoom {
 
   async reportStatsToRegistry() {
     try {
-      // Get room ID from state
       let roomId = this.state.id.toString();
-      
       let registryId = this.env.roomRegistry.idFromName("global");
       let registry = this.env.roomRegistry.get(registryId);
       
@@ -503,13 +632,12 @@ export class ChatRoom {
         })
       });
     } catch (err) {
-      // Silently fail - registry updates are best-effort
-      console.error("Failed to report stats:", err);
+      // Best effort
     }
   }
 }
 
-// RateLimiter Durable Object - Less aggressive: 1 msg per 2s with 15s grace
+// RateLimiter Durable Object - Optimized with configurable limits
 export class RateLimiter {
   constructor(state, env) {
     this.nextAllowedTime = 0;
@@ -521,11 +649,11 @@ export class RateLimiter {
       this.nextAllowedTime = Math.max(now, this.nextAllowedTime);
 
       if (request.method == "POST") {
-        this.nextAllowedTime += 2; // 2 seconds between messages (was 5)
+        this.nextAllowedTime += CONFIG.RATE_LIMIT_WINDOW;
       }
 
-      let cooldown = Math.max(0, this.nextAllowedTime - now - 15); // 15s grace period (was 20)
-      return new Response(cooldown);
+      let cooldown = Math.max(0, this.nextAllowedTime - now - CONFIG.RATE_LIMIT_GRACE);
+      return new Response(cooldown.toString());
     });
   }
 }
