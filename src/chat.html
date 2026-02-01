@@ -680,7 +680,9 @@ function startChat() {
     if (AppState.currentWebSocket) {
       AppState.currentWebSocket.send(JSON.stringify({message: elements.chatInput.value}));
       elements.chatInput.value = "";
-      elements.chatlog.scrollBy(0, 1e8);
+      // Scroll to bottom after sending
+      elements.chatlog.scrollTop = elements.chatlog.scrollHeight;
+      AppState.isAtBottom = true;
     }
   });
 
@@ -691,7 +693,10 @@ function startChat() {
   });
 
   elements.chatlog.addEventListener("scroll", () => {
-    AppState.isAtBottom = elements.chatlog.scrollTop + elements.chatlog.clientHeight >= elements.chatlog.scrollHeight;
+    // Check if we're near the bottom (within 50px)
+    const scrollBottom = elements.chatlog.scrollTop + elements.chatlog.clientHeight;
+    const threshold = 50;
+    AppState.isAtBottom = scrollBottom >= elements.chatlog.scrollHeight - threshold;
   });
 
   elements.chatInput.focus();
@@ -704,7 +709,7 @@ function startChat() {
   if('visualViewport' in window) {
     window.visualViewport.addEventListener('resize', () => {
       if (AppState.isAtBottom) {
-        elements.chatlog.scrollBy(0, 1e8);
+        elements.chatlog.scrollTop = elements.chatlog.scrollHeight;
       }
     });
   }
@@ -777,10 +782,11 @@ function join() {
               "* Welcome to #" + AppState.currentRoom + ". Say hi!");
         }
       }
-    } else {
-      if (data.timestamp > AppState.lastSeenTimestamp) {
-        addChatMessage(data.name, data.message);
-        AppState.lastSeenTimestamp = data.timestamp;
+    } else if (data.name && data.message) {
+      // Regular chat message - always display it
+      addChatMessage(data.name, data.message);
+      if (data.timestamp) {
+        AppState.lastSeenTimestamp = Math.max(AppState.lastSeenTimestamp, data.timestamp);
       }
     }
   });
@@ -808,8 +814,11 @@ function addChatMessage(name, text) {
   p.appendChild(document.createTextNode(text));
 
   elements.chatlog.appendChild(p);
+  
+  // Auto scroll to bottom
   if (AppState.isAtBottom) {
-    elements.chatlog.scrollBy(0, 1e8);
+    // Use scrollTop for more reliable scrolling
+    elements.chatlog.scrollTop = elements.chatlog.scrollHeight;
   }
 }
 

@@ -261,10 +261,14 @@ export class ChatRoom {
     this.storage = state.storage;
     this.env = env;
     this.sessions = new Map();
+    this.connectedUsers = new Set(); // Track connected usernames to prevent duplicates
     
     // Restore sessions from hibernation
     this.state.getWebSockets().forEach((webSocket) => {
       let meta = webSocket.deserializeAttachment();
+      if (meta.name) {
+        this.connectedUsers.add(meta.name);
+      }
       let limiterId = this.env.limiters.idFromString(meta.limiterId);
       let limiter = new RateLimiterClient(
         () => this.env.limiters.get(limiterId),
@@ -342,8 +346,8 @@ export class ChatRoom {
       session.blockedMessages.push(value);
     });
 
-    // Report stats update to registry
-    await this.reportStatsToRegistry();
+    // Report stats update to registry asynchronously (don't block)
+    this.reportStatsToRegistry().catch(err => {});
   }
 
   async webSocketMessage(webSocket, msg) {
@@ -365,7 +369,17 @@ export class ChatRoom {
 
       if (!session.name) {
         // First message - user info
-        session.name = "" + (data.name || "anonymous");
+        let requestedName = "" + (data.name || "anonymous");
+        
+        // Check if user with this name is already connected
+        if (this.connectedUsers.has(requestedName)) {
+          webSocket.send(JSON.stringify({error: "Username already in use. Please choose a different name."}));
+          webSocket.close(1008, "Duplicate username");
+          return;
+        }
+        
+        session.name = requestedName;
+        this.connectedUsers.add(session.name);
         webSocket.serializeAttachment({ ...webSocket.deserializeAttachment(), name: session.name });
 
         if (session.name.length > 32) {
@@ -384,8 +398,8 @@ export class ChatRoom {
         this.broadcast({joined: session.name});
         webSocket.send(JSON.stringify({ready: true}));
         
-        // Report stats update
-        await this.reportStatsToRegistry();
+        // Report stats update asynchronously (don't block)
+        this.reportStatsToRegistry().catch(err => {});
         return;
       }
 
@@ -405,14 +419,16 @@ export class ChatRoom {
       this.lastTimestamp = data.timestamp;
 
       let dataStr = JSON.stringify(data);
+      
+      // Broadcast immediately for speed
       this.broadcast(dataStr);
 
-      // Save message
+      // Save message and report stats asynchronously (don't block)
       let key = new Date(data.timestamp).toISOString();
-      await this.storage.put(key, dataStr);
+      this.storage.put(key, dataStr).catch(err => console.error("Failed to save message:", err));
       
-      // Report stats update
-      await this.reportStatsToRegistry();
+      // Report stats update asynchronously
+      this.reportStatsToRegistry().catch(err => {});
     } catch (err) {
       webSocket.send(JSON.stringify({error: err.stack}));
     }
@@ -423,10 +439,12 @@ export class ChatRoom {
     session.quit = true;
     this.sessions.delete(webSocket);
     if (session.name) {
+      // Remove from connected users set to allow reconnection
+      this.connectedUsers.delete(session.name);
       this.broadcast({quit: session.name});
     }
-    // Report stats update
-    await this.reportStatsToRegistry();
+    // Report stats update asynchronously (don't block)
+    this.reportStatsToRegistry().catch(err => {});
   }
 
   async webSocketClose(webSocket, code, reason, wasClean) {
@@ -491,7 +509,7 @@ export class ChatRoom {
   }
 }
 
-// RateLimiter Durable Object
+// RateLimiter Durable Object - Less aggressive: 1 msg per 2s with 15s grace
 export class RateLimiter {
   constructor(state, env) {
     this.nextAllowedTime = 0;
@@ -503,10 +521,10 @@ export class RateLimiter {
       this.nextAllowedTime = Math.max(now, this.nextAllowedTime);
 
       if (request.method == "POST") {
-        this.nextAllowedTime += 5;
+        this.nextAllowedTime += 2; // 2 seconds between messages (was 5)
       }
 
-      let cooldown = Math.max(0, this.nextAllowedTime - now - 20);
+      let cooldown = Math.max(0, this.nextAllowedTime - now - 15); // 15s grace period (was 20)
       return new Response(cooldown);
     });
   }
